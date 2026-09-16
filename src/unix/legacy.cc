@@ -55,12 +55,15 @@ static WatcherError pathError(const char *op, const std::string &path, int error
     return WatcherError(std::string(op) + " on '" + path + "' failed: " + strerror(error), watcher);
 }
 
-void iterateDir(WatcherRef watcher, const std::shared_ptr <DirTree> tree, const char *relative, int parent_fd, const std::string &dirname, DirectoryAncestors &ancestors) {
+void iterateDir(WatcherRef watcher, const std::shared_ptr <DirTree> tree, const char *relative, int parent_fd, const std::string &dirname, DirectoryAncestors &ancestors, bool isRoot) {
     int open_flags = (O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOCTTY | O_NONBLOCK | O_NOFOLLOW);
     int new_fd = openat(parent_fd, relative, open_flags);
     if (new_fd == -1) {
-        if (errno == EACCES) {
-            return; // ignore insufficient permissions
+        // ENOENT means the directory was removed between the caller's fstatat
+        // and this open, which is routine in a tree that is being written to
+        // while it is read. Treat it like a directory we were never told about.
+        if (errno == EACCES || (!isRoot && errno == ENOENT)) {
+            return;
         }
 
         throw pathError("openat", dirname, errno, watcher);
@@ -116,7 +119,7 @@ void iterateDir(WatcherRef watcher, const std::shared_ptr <DirTree> tree, const 
             bool isDir = S_ISDIR(attrib.st_mode);
 
             if (isDir) {
-                iterateDir(watcher, tree, ent->d_name, new_fd, fullPath, ancestors);
+                iterateDir(watcher, tree, ent->d_name, new_fd, fullPath, ancestors, false);
             } else {
                 tree->add(fullPath, CONVERT_TIME(attrib.st_mtim), isDir);
             }
@@ -136,7 +139,7 @@ void BruteForceBackend::readTree(WatcherRef watcher, std::shared_ptr <DirTree> t
 
     DirectoryAncestors ancestors;
     try {
-        iterateDir(watcher, tree, ".", fd, watcher->mDir, ancestors);
+        iterateDir(watcher, tree, ".", fd, watcher->mDir, ancestors, true);
     } catch (...) {
         close(fd);
         throw;
