@@ -66,6 +66,8 @@ jobs:
       - run: yarn --frozen-lockfile
       - run: yarn build
       - run: yarn test
+        env:
+          REQUIRE_DIRECTORY_CYCLE_TEST: 1
 
   test-freebsd:
     runs-on: ubuntu-latest
