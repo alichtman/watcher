@@ -17,7 +17,7 @@ struct Glob {
     return mHash == other.mHash && mRaw == other.mRaw;
   }
 
-  bool isIgnored(std::string relative_path) const;
+  bool isIgnored(const std::string &relative_path) const;
 };
 
 namespace std

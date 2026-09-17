@@ -215,7 +215,7 @@ void Watcher::clearCallbacks() {
   unref();
 }
 
-bool Watcher::isIgnored(std::string path) {
+bool Watcher::isIgnored(const std::string &path) {
   for (auto it = mIgnorePaths.begin(); it != mIgnorePaths.end(); it++) {
     auto dir = *it + DIR_SEP;
     if (*it == path || path.compare(0, dir.size(), dir) == 0) {

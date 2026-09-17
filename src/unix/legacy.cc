@@ -40,9 +40,66 @@ public:
         mAncestors.erase(mIdentity);
     }
 
+    // A copy would erase the identity when the first of the two goes out of
+    // scope, reopening the cycle it is meant to close.
+    ScopedDirectoryAncestor(const ScopedDirectoryAncestor &) = delete;
+    ScopedDirectoryAncestor &operator=(const ScopedDirectoryAncestor &) = delete;
+
 private:
     DirectoryAncestors &mAncestors;
     DirectoryIdentity mIdentity;
+};
+
+class ScopedFileDescriptor {
+public:
+    explicit ScopedFileDescriptor(int fd) : mFd(fd) {}
+
+    ~ScopedFileDescriptor() {
+        if (mFd != -1) {
+            close(mFd);
+        }
+    }
+
+    ScopedFileDescriptor(const ScopedFileDescriptor &) = delete;
+    ScopedFileDescriptor &operator=(const ScopedFileDescriptor &) = delete;
+
+    int get() const {
+        return mFd;
+    }
+
+    int release() {
+        int fd = mFd;
+        mFd = -1;
+        return fd;
+    }
+
+private:
+    int mFd;
+};
+
+class ScopedPathComponent {
+public:
+    ScopedPathComponent(std::string &path, const char *component)
+        : mPath(path), mOriginalSize(path.size()) {
+        try {
+            mPath.push_back('/');
+            mPath.append(component);
+        } catch (...) {
+            mPath.resize(mOriginalSize);
+            throw;
+        }
+    }
+
+    ~ScopedPathComponent() {
+        mPath.resize(mOriginalSize);
+    }
+
+    ScopedPathComponent(const ScopedPathComponent &) = delete;
+    ScopedPathComponent &operator=(const ScopedPathComponent &) = delete;
+
+private:
+    std::string &mPath;
+    size_t mOriginalSize;
 };
 
 struct DirectoryCloser {
@@ -55,10 +112,17 @@ static WatcherError pathError(const char *op, const std::string &path, int error
     return WatcherError(std::string(op) + " on '" + path + "' failed: " + strerror(error), watcher);
 }
 
-void iterateDir(WatcherRef watcher, const std::shared_ptr <DirTree> tree, const char *relative, int parent_fd, const std::string &dirname, DirectoryAncestors &ancestors, bool isRoot) {
+void iterateDir(
+    WatcherRef watcher,
+    const std::shared_ptr <DirTree> tree,
+    const char *relative,
+    int parent_fd,
+    std::string &path,
+    DirectoryAncestors &ancestors,
+    bool isRoot) {
     int open_flags = (O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOCTTY | O_NONBLOCK | O_NOFOLLOW);
-    int new_fd = openat(parent_fd, relative, open_flags);
-    if (new_fd == -1) {
+    ScopedFileDescriptor scoped_fd(openat(parent_fd, relative, open_flags));
+    if (scoped_fd.get() == -1) {
         // ENOENT means the directory was removed between the caller's fstatat
         // and this open, which is routine in a tree that is being written to
         // while it is read. Treat it like a directory we were never told about.
@@ -66,14 +130,13 @@ void iterateDir(WatcherRef watcher, const std::shared_ptr <DirTree> tree, const 
             return;
         }
 
-        throw pathError("openat", dirname, errno, watcher);
+        throw pathError("openat", path, errno, watcher);
     }
+    int new_fd = scoped_fd.get();
 
     struct stat rootAttributes;
     if (fstat(new_fd, &rootAttributes) != 0) {
-        int error = errno;
-        close(new_fd);
-        throw pathError("fstat", dirname, error, watcher);
+        throw pathError("fstat", path, errno, watcher);
     }
 
     DirectoryIdentity identity(rootAttributes.st_dev, rootAttributes.st_ino);
@@ -81,68 +144,63 @@ void iterateDir(WatcherRef watcher, const std::shared_ptr <DirTree> tree, const 
     // than symlinks. Only reject identities in the current ancestry so the same
     // directory can still be visited through independent, non-cyclic paths.
     if (!ancestors.insert(identity).second) {
-        close(new_fd);
         return;
     }
     ScopedDirectoryAncestor ancestor(ancestors, identity);
 
     DIR *rawDir = fdopendir(new_fd);
     if (!rawDir) {
-        int error = errno;
-        close(new_fd);
-        throw pathError("fdopendir", dirname, error, watcher);
+        throw pathError("fdopendir", path, errno, watcher);
     }
+    // fdopendir takes ownership of the descriptor, so closedir now covers it.
+    scoped_fd.release();
     std::unique_ptr<DIR, DirectoryCloser> dir(rawDir);
 
-    tree->add(dirname, CONVERT_TIME(rootAttributes.st_mtim), true);
+    tree->add(path, CONVERT_TIME(rootAttributes.st_mtim), true);
 
     while (struct dirent *ent = (errno = 0, readdir(dir.get()))) {
         if (ISDOT(ent->d_name)) continue;
 
-        std::string fullPath = dirname + "/" + ent->d_name;
+        ScopedPathComponent childPath(path, ent->d_name);
         // Skip the entry before handing an unbounded string to the recursive
         // std::regex matcher behind isIgnored(). Skipping rather than failing
         // keeps the rest of the tree usable: only inotify cannot watch paths
         // beyond PATH_MAX, while the brute force and wasm backends traverse
         // entirely through descriptor-relative calls and have no such limit.
-        if (fullPath.size() >= PATH_MAX) continue;
+        if (path.size() >= PATH_MAX) continue;
 
-        if (!watcher->isIgnored(fullPath)) {
+        if (!watcher->isIgnored(path)) {
             struct stat attrib;
             if (fstatat(new_fd, ent->d_name, &attrib, AT_SYMLINK_NOFOLLOW) != 0) {
                 if (errno == EACCES || errno == ENOENT) {
                     continue;
                 }
 
-                throw pathError("fstatat", fullPath, errno, watcher);
+                throw pathError("fstatat", path, errno, watcher);
             }
             bool isDir = S_ISDIR(attrib.st_mode);
 
             if (isDir) {
-                iterateDir(watcher, tree, ent->d_name, new_fd, fullPath, ancestors, false);
+                iterateDir(watcher, tree, ent->d_name, new_fd, path, ancestors, false);
             } else {
-                tree->add(fullPath, CONVERT_TIME(attrib.st_mtim), isDir);
+                tree->add(path, CONVERT_TIME(attrib.st_mtim), isDir);
             }
         }
     }
 
     if (errno) {
-        throw pathError("readdir", dirname, errno, watcher);
+        throw pathError("readdir", path, errno, watcher);
     }
 }
 
 void BruteForceBackend::readTree(WatcherRef watcher, std::shared_ptr <DirTree> tree) {
-    int fd = open(watcher->mDir.c_str(), O_RDONLY);
-    if (fd == -1) {
+    ScopedFileDescriptor fd(open(watcher->mDir.c_str(), O_RDONLY));
+    if (fd.get() == -1) {
         throw pathError("open", watcher->mDir, errno, watcher);
     }
 
     DirectoryAncestors ancestors;
-    try {
-        iterateDir(watcher, tree, ".", fd, watcher->mDir, ancestors, true);
-    } catch (...) {
-        close(fd);
-        throw;
-    }
-    close(fd);
+    std::string path = watcher->mDir;
+    path.reserve(PATH_MAX);
+    iterateDir(watcher, tree, ".", fd.get(), path, ancestors, true);
 }

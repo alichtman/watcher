@@ -47,7 +47,7 @@ struct Watcher {
   bool watch(Function callback);
   bool unwatch(Function callback);
   void unref();
-  bool isIgnored(std::string path);
+  bool isIgnored(const std::string &path);
   void destroy();
 
   static WatcherRef getShared(std::string dir, std::unordered_set<std::string> ignorePaths, std::unordered_set<Glob> ignoreGlobs);

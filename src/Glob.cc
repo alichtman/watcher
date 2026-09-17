@@ -12,7 +12,7 @@ Glob::Glob(std::string raw) {
   #endif
 }
 
-bool Glob::isIgnored(std::string relative_path) const {
+bool Glob::isIgnored(const std::string &relative_path) const {
   // Use native JS regex engine for wasm to reduce binary size.
   #ifdef __wasm32__
     return wasm_regex_match(relative_path.c_str(), mRaw.c_str());
